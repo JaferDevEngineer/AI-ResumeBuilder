@@ -1,0 +1,254 @@
+import sys, io
+import requests
+import json
+import telegram
+import re
+import os
+import random
+import math
+from datetime import datetime
+
+# ✅ Force stdout to UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+# ✅ Create folders by date
+current_date = datetime.now().strftime("%d-%m-%Y")
+output_dir = os.path.join(os.getcwd(), current_date)
+os.makedirs(output_dir, exist_ok=True)
+
+resume_dir = os.path.join(output_dir, "resume")
+os.makedirs(resume_dir, exist_ok=True)
+
+# ----------------------------------------------------
+# 🔹 1. Fetch jobs from Apify LinkedIn Scraper
+# ----------------------------------------------------
+def fetch_linkedin_jobs():
+    url = "https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/run-sync-get-dataset-items"
+    api_token = ""
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "count": 100,
+        "scrapeCompany": True,
+        "urls": [
+            "https://www.linkedin.com/jobs/search-results/?distance=25.0&f_TPR=r86400&geoId=90009647&keywords=Java%20developer&origin=HISTORY&location=Chennai%2C%20Tamil%20Nadu%2C%20India"
+        ]
+    }
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code == 201:
+        result = response.json()
+        print(f"✅ Total jobs fetched: {len(result)}")
+        return result
+    else:
+        print(f"❌ Error {response.status_code}: {response.text}")
+        return []
+
+data = fetch_linkedin_jobs()
+print("Total jobs:", len(data))
+
+# ----------------------------------------------------
+# 🔹 2. Skill-based scoring (IMPROVED, NOT REMOVED)
+# ----------------------------------------------------
+
+# 🔹 NEW: weighted skills (backend-focused)
+SKILL_WEIGHTS = {
+    "java": 3.0,
+    "spring boot": 3.0,
+    "spring": 2.0,
+    "microservices": 2.5,
+    "rest api": 2.0,
+    "hibernate": 1.5,
+    "jpa": 1.5,
+    "docker": 1.5,
+    "aws": 1.5,
+    "kafka": 1.2,
+    "redis": 1.0,
+    "mysql": 1.0,
+    "postgresql": 1.0,
+    "react": 0.4,
+    "angular": 0.4
+}
+
+BACKEND_SIGNALS = [
+    "java", "spring", "backend", "microservice", "rest api"
+]
+
+OPTIONAL_HINTS = ["good to have", "nice to have", "optional", "plus"]
+SENIOR_HINTS = ["architect", "lead", "mentor", "ownership", "design authority"]
+
+# 🔹 REPLACED: get_match_score (same name, better logic)
+def get_match_score(job_text, skills_text=None):
+    if not job_text:
+        return 0.0
+
+    text = job_text.lower()
+    score = 0.0
+
+    # phrase + keyword matching
+    for skill, weight in SKILL_WEIGHTS.items():
+        if skill in text:
+            if any(hint in text for hint in OPTIONAL_HINTS):
+                score += weight * 0.6   # penalty for optional
+            else:
+                score += weight
+
+    # senior-role penalty
+    if any(word in text for word in SENIOR_HINTS):
+        score *= 0.75
+
+    # normalize by JD length
+    word_count = len(text.split())
+    score = score / math.log(word_count + 10)
+
+    return round(score, 3)
+
+# ----------------------------------------------------
+# 🔹 3. Experience extraction + filtering (UNCHANGED)
+# ----------------------------------------------------
+TARGET_YEARS = 3
+ALLOW_NO_EXPERIENCE = True
+EXPERIENCE_BOOST = 1.15
+
+def parse_experience_from_text(text):
+    if not text:
+        return (None, None, None)
+    text = text.lower().replace("yrs", "years")
+    patterns = [
+        r'(\d+)\s*-\s*(\d+)\s*years',
+        r'(\d+)\s*to\s*(\d+)\s*years',
+        r'minimum\s*(\d+)\s*years',
+        r'(\d+)\s*\+\s*years',
+        r'(\d+)\s*years'
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            nums = re.findall(r'\d+', m.group(0))
+            if len(nums) == 2:
+                return (int(nums[0]), int(nums[1]), "regex")
+            elif len(nums) == 1:
+                num = int(nums[0])
+                if '+' in m.group(0) or 'minimum' in m.group(0):
+                    return (num, None, "regex")
+                return (num, num, "regex")
+    if re.search(r'\b(junior|entry[- ]level|fresher|graduate)\b', text):
+        return (0, 2, "junior")
+    if re.search(r'\b(mid[- ]level|associate|experienced)\b', text):
+        return (2, 5, "mid")
+    if re.search(r'\b(senior|lead|principal)\b', text):
+        return (5, None, "senior")
+    return (None, None, None)
+
+def experience_matches(min_y, max_y, target=TARGET_YEARS):
+    if min_y is None and max_y is None:
+        return None
+    if min_y is not None and max_y is not None:
+        return (min_y <= target <= max_y)
+    if min_y is not None and max_y is None:
+        return (min_y <= target)
+    if min_y is None and max_y is not None:
+        return (target <= max_y)
+    return None
+
+# ----------------------------------------------------
+# 🔹 4. Rank jobs by skill + experience (MINIMAL CHANGE)
+# ----------------------------------------------------
+scored_jobs = []
+for job in data:
+    job_text = job.get("descriptionText", "") or job.get("description", "")
+    job_title = job.get("title", "").lower()
+
+    # 🔹 improved backend filter
+    if not any(sig in job_text.lower() or sig in job_title for sig in BACKEND_SIGNALS):
+        continue
+
+    score = get_match_score(job_text)
+
+    min_y, max_y, src = parse_experience_from_text(job_text)
+    match = experience_matches(min_y, max_y, TARGET_YEARS)
+
+    if match is False:
+        continue
+    if match is None and not ALLOW_NO_EXPERIENCE:
+        continue
+
+    if match is True:
+        score *= EXPERIENCE_BOOST
+
+    job_copy = job.copy()
+    job_copy["relevanceScore"] = round(score, 3)
+    job_copy["exp_min"] = min_y
+    job_copy["exp_max"] = max_y
+    job_copy["exp_match"] = match
+    scored_jobs.append(job_copy)
+
+scored_jobs.sort(key=lambda x: x["relevanceScore"], reverse=True)
+top_jobs = scored_jobs[:20]
+
+for idx, job in enumerate(top_jobs, start=1):
+    print(f"Rank {idx}: {job.get('companyName','Unknown')} | "
+          f"Score: {job['relevanceScore']} | "
+          f"Exp: {job.get('exp_min')} - {job.get('exp_max')}")
+
+# ----------------------------------------------------
+# 🔹 5. LaTeX resume base template (UNCHANGED)
+# ----------------------------------------------------
+xelatexCode = r"""
+
+"""
+
+
+# ----------------------------------------------------
+# 🔹 6. Gemini resume generation (UNCHANGED)
+# ----------------------------------------------------
+payload_template = {
+    "contents": [
+        {
+            "parts": [
+                {
+                    "text": (
+                        "You are a professional LaTeX resume writer. "
+                        "Update my resume to fit the job description.\n\n"
+                        f"{xelatexCode}\n\n"
+                        "Job description:\n\n"
+                        "{JOB_DESCRIPTION}\n\n"
+                        "Do NOT invent skills or experience.\n"
+                        "Return only valid XeLaTeX code."
+                    )
+                }
+            ]
+        }
+    ]
+}
+
+for job in top_jobs:
+    job_description = job.get("descriptionText", "")
+    payload = json.loads(json.dumps(payload_template))
+    payload["contents"][0]["parts"][0]["text"] = payload["contents"][0]["parts"][0]["text"].replace(
+        "{JOB_DESCRIPTION}", job_description
+    )
+
+    response = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload)
+    )
+
+    if response.status_code == 200:
+        result = response.json()
+        company_name = job.get("companyName", "unknown_company")
+        safe_filename = re.sub(r'[^a-zA-Z0-9_-]', '_', company_name)[:80]
+        output_file = os.path.join(resume_dir, f"{safe_filename}{random.randint(1000,9999)}.tex")
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(result["candidates"][0]["content"]["parts"][0]["text"])
+
+        print(f"✅ File saved: {output_file}")
+    else:
+        print(f"❌ Gemini API Error {response.status_code}")
+
+print("\n✅ Completed resume generation.")
